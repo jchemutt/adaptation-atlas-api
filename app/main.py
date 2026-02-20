@@ -33,6 +33,8 @@ class Settings:
 
     allow_any_url: bool
     allowed_parquet_hosts: List[str]
+    allow_s3_urls: bool
+    allowed_s3_buckets: List[str]
 
     cors_origins: List[str]
     cors_origin_regex: Optional[str]
@@ -62,6 +64,9 @@ class Settings:
             if h.strip()
         ]
 
+
+        allow_s3_urls = _bool("ALLOW_S3_URLS", "true")
+        allowed_s3_buckets = [b.strip() for b in os.getenv("ALLOWED_S3_BUCKETS", "digital-atlas").split(",") if b.strip()]
         cors_origins = [
             o.strip()
             for o in os.getenv(
@@ -90,6 +95,8 @@ class Settings:
             materialize_keep_days=materialize_keep_days,
             allow_any_url=allow_any_url,
             allowed_parquet_hosts=allowed_parquet_hosts,
+            allow_s3_urls=allow_s3_urls,
+            allowed_s3_buckets=allowed_s3_buckets,
             cors_origins=cors_origins,
             cors_origin_regex=cors_origin_regex,
             allow_broad_geo=allow_broad_geo,
@@ -169,6 +176,10 @@ class HazardByCropRequest(BaseQuery):
     hazards: Optional[List[str]] = None
     top_hazards: Optional[int] = None
     top_crops: Optional[int] = None
+    bucket_other: Optional[bool] = Field(
+        default=True,
+        description='If true, bucket non-top crops into "Other" when top_crops is set. If false, drop non-top crops instead.',
+    )
 
 
 class ByAdminRequest(BaseQuery):
@@ -177,9 +188,13 @@ class ByAdminRequest(BaseQuery):
 
 
 class DenomTotalRequest(BaseModel):
-    denom_url: str = Field(..., description="HTTPS URL to total exposure parquet")
+    denom_url: str = Field(..., description="HTTPS or s3:// URL to total exposure parquet")
     geo: GeoFilter
     commodities: List[str] = Field(default_factory=list)
+    # Shiny parity: exposure + unit are separate.
+    exposure: Optional[str] = None
+    unit: Optional[str] = None
+    # Backwards compatibility: some clients send only exposure_unit.
     exposure_unit: Optional[str] = None
     cache_ttl_seconds: Optional[int] = None
 
@@ -187,6 +202,12 @@ class DenomTotalRequest(BaseModel):
 class Q1Request(BaseModel):
     left: TotalsByHazardRequest
     right: TotalsByHazardRequest
+    denom: Optional[DenomTotalRequest] = None
+
+
+class Q2Request(BaseModel):
+    left: HazardByCropRequest
+    right: HazardByCropRequest
     denom: Optional[DenomTotalRequest] = None
 
 
@@ -358,21 +379,46 @@ def _hazard_vars_where(hazard_vars: Optional[List[str]], method: str, commodity_
 
 
 def _validate_url(url: str) -> None:
+    # Allow opt-out of URL restrictions for trusted deployments.
     if S.allow_any_url:
         return
+
     u = urlparse(url)
-    if u.scheme != "https":
-        raise HTTPException(status_code=400, detail="Only https:// URLs are allowed")
-    host = (u.hostname or "").lower()
-    if host not in S.allowed_parquet_hosts:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Host '{host}' not allowlisted. Allowed: {', '.join(S.allowed_parquet_hosts)}",
-        )
+    scheme = (u.scheme or "").lower()
+
+    if scheme == "https":
+        host = (u.hostname or "").lower()
+        if host not in S.allowed_parquet_hosts:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Host '{host}' not allowlisted. Allowed: {', '.join(S.allowed_parquet_hosts)}",
+            )
+        return
+
+    if scheme == "s3":
+        if not S.allow_s3_urls:
+            raise HTTPException(status_code=400, detail="s3:// URLs are disabled")
+        bucket = (u.netloc or "").strip()
+        if not bucket:
+            raise HTTPException(status_code=400, detail="Invalid s3:// URL (missing bucket)")
+        if bucket not in S.allowed_s3_buckets:
+            raise HTTPException(
+                status_code=400,
+                detail=f"S3 bucket '{bucket}' not allowlisted. Allowed: {', '.join(S.allowed_s3_buckets)}",
+            )
+        return
+
+    raise HTTPException(status_code=400, detail="Only https:// or s3:// URLs are allowed")
 
 
 def _parquet_magic_check(url: str) -> None:
     if not S.parquet_magic_check:
+        return
+    # Magic header check only works for HTTP(S) URLs.
+    try:
+        if urlparse(url).scheme.lower() != "https":
+            return
+    except Exception:
         return
     try:
         with httpx.Client(timeout=10.0, follow_redirects=True) as client:
@@ -719,7 +765,7 @@ def _query_hazard_by_crop(req: HazardByCropRequest) -> List[Dict[str, Any]]:
         keep_set = set(keep)
         rows = [r for r in rows if str(r.get("hazard") or "") in keep_set]
 
-    # Top crops (bucket non-top into "Other")
+    # Top crops: either bucket non-top into "Other" (default) or drop them (bucket_other=False).
     if req.top_crops and req.top_crops > 0:
         crop_tot: Dict[str, float] = {}
         for r in rows:
@@ -728,14 +774,19 @@ def _query_hazard_by_crop(req: HazardByCropRequest) -> List[Dict[str, Any]]:
         keep = [c for c, _ in sorted(crop_tot.items(), key=lambda kv: kv[1], reverse=True)[: int(req.top_crops)]]
         keep_set = set(keep)
 
-        agg: Dict[Tuple[str, str], float] = {}
-        for r in rows:
-            h = str(r.get("hazard") or "")
-            c0 = str(r.get("crop") or "")
-            c = c0 if c0 in keep_set else "Other"
-            agg[(h, c)] = agg.get((h, c), 0.0) + float(r["total"])
+        if req.bucket_other is False:
+            # Shiny-compatible: filter to top crops only (no "Other" bucket).
+            rows = [r for r in rows if str(r.get("crop") or "") in keep_set]
+        else:
+            # Default: keep totals consistent for stacked charts by bucketing into "Other".
+            agg: Dict[Tuple[str, str], float] = {}
+            for r in rows:
+                h = str(r.get("hazard") or "")
+                c0 = str(r.get("crop") or "")
+                c = c0 if c0 in keep_set else "Other"
+                agg[(h, c)] = agg.get((h, c), 0.0) + float(r["total"])
 
-        rows = [{"hazard": h, "crop": c, "total": t} for (h, c), t in agg.items()]
+            rows = [{"hazard": h, "crop": c, "total": t} for (h, c), t in agg.items()]
 
     # Sort hazards by their total, then crops within hazard by total
     haz_tot2: Dict[str, float] = {}
@@ -796,6 +847,108 @@ def _query_by_admin(req: ByAdminRequest) -> List[Dict[str, Any]]:
         con.close()
 
 
+
+def _denom_query_try(
+    con: duckdb.DuckDBPyConnection,
+    denom_url: str,
+    base_wheres: List[str],
+    exposure: Optional[str],
+    unit: Optional[str],
+    exposure_unit_legacy: Optional[str],
+    group_by_crop: bool,
+) -> Any:
+    """Try denom queries against slightly different schemas.
+
+    Supported denom schemas we see in Atlas/Shiny:
+      A) legacy: columns include (admin0_name, admin1_name, admin2_name, crop, value, exposure_unit[, tech])
+      B) harmonized: columns include (admin*_name, crop, value, exposure, unit[, tech, stat])
+
+    We try combinations of possible column names to stay robust.
+    """
+    # column name variants
+    exposure_cols = ["exposure", "exposure_short", "exposure_type"]
+    unit_cols = ["unit", "exposure_unit"]
+
+    # Resolve legacy single-field if provided
+    exp = exposure
+    unt = unit
+    if exp is None and unt is None and exposure_unit_legacy:
+        # If the value looks like a known exposure key, map to Shiny-like defaults.
+        v = str(exposure_unit_legacy).strip()
+        if v in ("prod", "area", "vop"):
+            exp = {"prod": "prod", "area": "harv-area", "vop": "vop"}[v]
+            unt = {"prod": "t", "area": "ha", "vop": "intld15"}[v]
+        elif v in ("intld15", "usd", "usd15"):
+            exp = "vop"
+            unt = "usd" if v in ("usd", "usd15") else "intld15"
+        elif v in ("people", "number"):
+            exp, unt = "number", "number"
+        else:
+            # assume it's a unit (e.g., ha/t/usd/intld15)
+            unt = v
+
+    last_err: Optional[Exception] = None
+
+    # Try: with exposure+unit; then unit only; then legacy exposure_unit only
+    attempts = []
+    if exp and unt:
+        attempts.append(("exp+unit", exp, unt))
+    if unt:
+        attempts.append(("unit", None, unt))
+    if exposure_unit_legacy:
+        attempts.append(("legacy", None, exposure_unit_legacy))
+
+    for _, exp_val, unit_val in attempts:
+        for use_exp_col in ([True] if exp_val else [False]):
+            for exp_col in (exposure_cols if use_exp_col else [None]):
+                for unit_col in unit_cols:
+                    for use_tech in (True, False):
+                        wheres = list(base_wheres)
+
+                        if exp_val and exp_col:
+                            wheres.append(f"{exp_col} = {_sql_q(exp_val)}")
+                        if unit_val:
+                            wheres.append(f"{unit_col} = {_sql_q(unit_val)}")
+                        if use_tech:
+                            # Shiny uses: (tech='all' OR tech IS NULL)
+                            wheres.append("(tech = 'all' OR tech IS NULL)")
+
+                        where_sql = " AND ".join(wheres) if wheres else "TRUE"
+
+                        if group_by_crop:
+                            q = f"""
+                              SELECT crop,
+                                     COALESCE(SUM(CASE WHEN CAST(value AS DOUBLE)=CAST(value AS DOUBLE)
+                                                       THEN CAST(value AS DOUBLE) ELSE NULL END), 0.0) AS denom
+                              FROM read_parquet({_sql_q(denom_url)})
+                              WHERE {where_sql}
+                              GROUP BY crop
+                            """
+                        else:
+                            q = f"""
+                              SELECT COALESCE(SUM(CASE WHEN CAST(value AS DOUBLE)=CAST(value AS DOUBLE)
+                                                       THEN CAST(value AS DOUBLE) ELSE NULL END), 0.0) AS denom
+                              FROM read_parquet({_sql_q(denom_url)})
+                              WHERE {where_sql}
+                            """
+
+                        try:
+                            return _rows(con, q)
+                        except Exception as e:
+                            msg = str(e)
+                            last_err = e
+                            # schema mismatch: try next combo
+                            if "Binder" in msg and ("Referenced column" in msg or "Column" in msg):
+                                continue
+                            # other errors should surface
+                            raise
+
+    if last_err:
+        raise last_err
+    return []
+
+
+
 def _query_denom_total(req: DenomTotalRequest) -> Dict[str, Any]:
     _validate_url(req.denom_url)
     _parquet_magic_check(req.denom_url)
@@ -810,18 +963,18 @@ def _query_denom_total(req: DenomTotalRequest) -> Dict[str, Any]:
         _geo_where(req.geo),
         _crop_where(req.commodities),
     ]
-    if req.exposure_unit:
-        wheres.append(f"exposure_unit = {_sql_q(req.exposure_unit)}")
-
-    q = f"""
-      SELECT COALESCE(SUM(CASE WHEN CAST(value AS DOUBLE)=CAST(value AS DOUBLE) THEN CAST(value AS DOUBLE) ELSE NULL END), 0.0) AS denom
-      FROM read_parquet({_sql_q(req.denom_url)})
-      WHERE {' AND '.join(wheres)}
-    """
 
     con = _duckdb_connect(for_http_parquet=True)
     try:
-        rows = _rows(con, q)
+        rows = _denom_query_try(
+            con,
+            req.denom_url,
+            wheres,
+            req.exposure,
+            req.unit,
+            req.exposure_unit,
+            group_by_crop=False,
+        )
         denom = rows[0].get("denom") if rows else None
         try:
             n = float(denom) if denom is not None else None
@@ -834,9 +987,15 @@ def _query_denom_total(req: DenomTotalRequest) -> Dict[str, Any]:
         con.close()
 
 
-def _query_records_page(req: RecordsRequest) -> Dict[str, Any]:
-    _validate_url(req.dataset_url)
-    _parquet_magic_check(req.dataset_url)
+
+def _query_denom_by_crop(req: DenomTotalRequest) -> List[Dict[str, Any]]:
+    """Return total exposure grouped by crop from the denom parquet.
+
+    This is used by Q2/Q4 to compute derived categories such as "no hazard" as:
+      value_tot(crop) - value_any_hazard(crop)
+    """
+    _validate_url(req.denom_url)
+    _parquet_magic_check(req.denom_url)
 
     if _is_broad_geo(req.geo) and not S.allow_broad_geo:
         raise HTTPException(
@@ -844,38 +1003,30 @@ def _query_records_page(req: RecordsRequest) -> Dict[str, Any]:
             detail="Broad geo selection is disabled. Select a specific admin0/admin1/admin2 or set ALLOW_BROAD_GEO=true.",
         )
 
-    page = max(1, int(req.page))
-    page_size = min(500, max(1, int(req.page_size)))
-    offset = (page - 1) * page_size
-
-    order = "value DESC" if req.sort == "value_desc" else "value ASC"
-    limit = page_size + 1
-
-    geo_where_expr = _geo_where(req.geo)
-
-    q = f"""
-      SELECT admin0_name, admin1_name, admin2_name,
-             scenario, timeframe, hazard, hazard_vars, crop,
-             CASE WHEN CAST(value AS DOUBLE)=CAST(value AS DOUBLE) THEN CAST(value AS DOUBLE) ELSE NULL END AS value
-      FROM read_parquet({_sql_q(req.dataset_url)})
-      WHERE {_scen_where(req.scen)}
-        AND {geo_where_expr}
-        AND {_crop_where(req.commodities)}
-        AND {_hazard_vars_where(req.hazard_vars, req.method, req.commodity_group)}
-      ORDER BY {order}
-      LIMIT {limit} OFFSET {offset}
-    """
+    base_wheres = [
+        _geo_where(req.geo),
+        _crop_where(req.commodities),
+    ]
 
     con = _duckdb_connect(for_http_parquet=True)
     try:
-        rows = _rows(con, q)
+        rows = _denom_query_try(con, req.denom_url, base_wheres, req.exposure, req.unit, req.exposure_unit, group_by_crop=True)
     finally:
         con.close()
 
-    has_more = len(rows) > page_size
-    rows = rows[:page_size]
+    # Normalize output keys to match older Shiny naming (value_tot)
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        crop = r.get("crop")
+        denom = r.get("denom")
+        try:
+            v = float(denom) if denom is not None else 0.0
+        except Exception:
+            v = 0.0
+        out.append({"crop": crop, "value_tot": v})
 
-    return {"page": page, "page_size": page_size, "has_more": has_more, "rows": rows}
+    return out
+
 
 
 def _export_records_csv(req: RecordsRequest) -> str:
@@ -1216,6 +1367,51 @@ async def q1(req: Q1Request) -> Dict[str, Any]:
         "right": right_rows,
         "merged": merged,
         "denom": denom_meta,
+        "relative_label": "% of total exposure" if denom_meta.get("ok") else "% of hazard sum (fallback)",
+        "t_ms": dt_ms,
+    }
+
+    await cache_store.set_json(key, out, ttl_seconds=ttl)
+    return {"ok": True, "cached": False, **out}
+
+
+
+@app.post("/api/v1/hz/q2")
+async def q2(req: Q2Request) -> Dict[str, Any]:
+    """Convenience endpoint for the Q2 chart (crop-centric exposure).
+
+    Returns hazard×crop rows for left/right scenarios plus (optionally) denom totals:
+    - denom: single global total
+    - denom_by_crop: per-crop totals for computing "no hazard" and percentages
+    """
+    assert cache_store is not None
+
+    payload = req.model_dump()
+    key = _cache_key("q2", payload)
+    ttl = _ttl(None)
+
+    cached, source = await cache_store.get_json(key, ttl_seconds=ttl)
+    if cached is not None:
+        return {"ok": True, "cached": True, "cache_source": source, **cached}
+
+    t0 = time.time()
+
+    left_rows = _query_hazard_by_crop(req.left)
+    right_rows = _query_hazard_by_crop(req.right)
+
+    denom_meta = {"ok": False, "denom": None, "error": "No denom"}
+    denom_by_crop: Optional[List[Dict[str, Any]]] = None
+    if req.denom is not None:
+        denom_meta = _query_denom_total(req.denom)
+        denom_by_crop = _query_denom_by_crop(req.denom)
+
+    dt_ms = int((time.time() - t0) * 1000)
+
+    out = {
+        "left": left_rows,
+        "right": right_rows,
+        "denom": denom_meta,
+        "denom_by_crop": denom_by_crop,
         "relative_label": "% of total exposure" if denom_meta.get("ok") else "% of hazard sum (fallback)",
         "t_ms": dt_ms,
     }
