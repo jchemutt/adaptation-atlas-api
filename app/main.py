@@ -184,6 +184,7 @@ class HazardByCropRequest(BaseQuery):
 
 class ByAdminRequest(BaseQuery):
     group_child: bool = True
+    group_hazard: bool = False
     hazards: Optional[List[str]] = None
 
 
@@ -817,7 +818,35 @@ def _query_by_admin(req: ByAdminRequest) -> List[Dict[str, Any]]:
     group_field, non_null = (_resolve_admin_group_fields(req.geo) if req.group_child else _resolve_admin_group_fields_current(req.geo))
     geo_where_expr = _geo_where_parent(req.geo) if req.group_child else _geo_where(req.geo)
 
-    q = f"""
+    # Backward-compatible default: totals by admin only.
+    # Optional Q4 mode: also group by hazard so the client can build compound/non-compound stacks.
+    if bool(getattr(req, "group_hazard", False)):
+        q = f"""
+  SELECT
+    {group_field} AS admin,
+    CAST(hazard AS VARCHAR) AS hazard,
+    COALESCE(
+      SUM(
+        CASE
+          WHEN CAST(value AS DOUBLE) = CAST(value AS DOUBLE) THEN CAST(value AS DOUBLE)
+          ELSE NULL
+        END
+      ),
+      0.0
+    ) AS total
+  FROM read_parquet({_sql_q(req.dataset_url)})
+  WHERE {_scen_where(req.scen)}
+    AND {geo_where_expr}
+    AND {_crop_where(req.commodities)}
+    AND {_hazard_vars_where(req.hazard_vars, req.method, req.commodity_group)}
+    AND {_haz_where(req.hazards)}
+    AND {non_null}
+    AND hazard IS NOT NULL
+  GROUP BY admin, hazard
+  ORDER BY admin ASC, total DESC
+"""
+    else:
+        q = f"""
   SELECT
     {group_field} AS admin,
     COALESCE(
