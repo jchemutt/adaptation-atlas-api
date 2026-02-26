@@ -3,6 +3,7 @@ import json
 import time
 import hashlib
 import tempfile
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -205,11 +206,42 @@ class Q1Request(BaseModel):
     right: TotalsByHazardRequest
     denom: Optional[DenomTotalRequest] = None
 
-
 class Q2Request(BaseModel):
     left: HazardByCropRequest
     right: HazardByCropRequest
     denom: Optional[DenomTotalRequest] = None
+
+
+class Q5ScenarioTime(BaseModel):
+    scenario: str
+    timeframe: str
+
+
+class Q5Request(BaseModel):
+    # Allow one or many sources so Q5 can combine historic + ensemble tables when needed.
+    dataset_url: Optional[str] = Field(default=None, description="Single parquet URL (alternative to dataset_urls)")
+    dataset_urls: List[str] = Field(default_factory=list, description="One or more parquet URLs to combine")
+
+    scenario_time: List[Q5ScenarioTime] = Field(default_factory=list, description="Scenario/timeframe pairs to return")
+    geo: GeoFilter
+
+    commodities: List[str] = Field(default_factory=list, description="crop codes; use ['all'] for all")
+    hazard_vars: Optional[List[str]] = Field(default=None, description="hazard_vars values")
+    method: str = Field(default="generic", description="generic | crop_specific")
+    commodity_group: str = Field(default="all")
+
+    severities: Optional[List[str]] = Field(default=None, description="Optional severity filter")
+    hazards: Optional[List[str]] = Field(
+        default=None,
+        description="Display hazards to return (supports raw hazards plus rollups like 'dry (any)', 'heat (any)', 'wet (any)', 'any')",
+    )
+
+    include_rollups: bool = Field(default=True, description="Include dry/heat/wet rollups aggregated from detailed hazards")
+    include_detail_hazards: bool = Field(default=False, description="Include raw detailed hazards in addition to rollups")
+    include_historic: bool = Field(default=True, description="Keep historic rows when present in scenario_time")
+    n_gcm_for_ci: int = Field(default=5, ge=1, description="Assumed number of GCMs when converting SD to CI")
+    historic_year: Optional[int] = Field(default=None, description="Optional numeric x-position for historic rows")
+    cache_ttl_seconds: Optional[int] = None
 
 
 class RecordsRequest(BaseQuery):
@@ -377,6 +409,308 @@ def _hazard_vars_where(hazard_vars: Optional[List[str]], method: str, commodity_
     m = (method or "").lower().strip()
     vals = crop_specific if m in ("crop", "crop_specific", "crop-specific") else generic
     return f"hazard_vars IN ({', '.join(_sql_q(v) for v in vals)})"
+
+
+
+def _severity_where(severities: Optional[List[str]]) -> str:
+    vals = _norm_list(severities or [])
+    if len(vals) == 0:
+        return "TRUE"
+    return f"severity IN ({', '.join(_sql_q(v) for v in vals)})"
+
+
+def _scenario_pairs_where(pairs: List[Q5ScenarioTime]) -> str:
+    wh: List[str] = []
+    for p in (pairs or []):
+        sc = str(getattr(p, "scenario", "") or "").strip()
+        tf = str(getattr(p, "timeframe", "") or "").strip()
+        if not sc or not tf:
+            continue
+        wh.append(f"(scenario = {_sql_q(sc)} AND timeframe = {_sql_q(tf)})")
+    return " OR ".join(wh) if wh else "FALSE"
+
+
+def _read_parquet_expr(urls: List[str]) -> str:
+    vals = [u for u in (_norm_list(urls) or []) if u]
+    if not vals:
+        raise HTTPException(status_code=400, detail="No dataset URLs provided.")
+    if len(vals) == 1:
+        return f"read_parquet({_sql_q(vals[0])})"
+    return "read_parquet([" + ", ".join(_sql_q(u) for u in vals) + "])"
+
+
+def _q5_dataset_urls(req: Q5Request) -> List[str]:
+    urls: List[str] = []
+    if req.dataset_url:
+        urls.append(str(req.dataset_url))
+    if req.dataset_urls:
+        urls.extend([str(u) for u in req.dataset_urls])
+
+    # de-duplicate while preserving order
+    dedup: List[str] = []
+    seen = set()
+    for u in urls:
+        uu = (u or "").strip()
+        if not uu or uu in seen:
+            continue
+        seen.add(uu)
+        dedup.append(uu)
+
+    if not dedup:
+        raise HTTPException(status_code=400, detail="Provide dataset_url or dataset_urls.")
+    return dedup
+
+
+def _timeframe_mid_year(tf: Optional[str], historic_year: Optional[int]) -> Optional[int]:
+    t = (str(tf or "").strip()).lower()
+    if not t:
+        return None
+    m = re.search(r"(\d{4})\s*[-_/]\s*(\d{4})", t)
+    if m:
+        a = int(m.group(1))
+        b = int(m.group(2))
+        return int(round((a + b) / 2.0))
+    m2 = re.search(r"(19\d{2}|20\d{2}|21\d{2})", t)
+    if m2:
+        return int(m2.group(1))
+    if t in ("historic", "historical", "baseline"):
+        return int(historic_year) if historic_year is not None else None
+    return int(historic_year) if historic_year is not None else None
+
+
+def _q5_hazard_rollup_name(hazard: Optional[str]) -> Optional[str]:
+    h = str(hazard or "").strip().lower()
+    if not h or h == "any":
+        return None
+    if h.endswith("(any)"):
+        return None
+    # Shiny-style Q5 facets: dry (any), heat (any), wet (any)
+    if h.startswith("dry"):
+        return "dry (any)"
+    if h.startswith("heat"):
+        return "heat (any)"
+    if h.startswith("wet"):
+        return "wet (any)"
+    # Fallbacks for alternative naming conventions
+    if "drought" in h or "dryness" in h:
+        return "dry (any)"
+    if "temp" in h or "hot" in h:
+        return "heat (any)"
+    if "rain" in h or "flood" in h or "wetness" in h:
+        return "wet (any)"
+    return None
+
+
+def _q5_hazard_order(h: str) -> int:
+    order = {"any": 0, "dry (any)": 1, "heat (any)": 2, "wet (any)": 3}
+    return order.get(str(h or "").lower(), 99)
+
+
+def _safe_float(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        x = float(v)
+    except Exception:
+        return None
+    if not (x == x) or x in (float("inf"), float("-inf")):
+        return None
+    return x
+
+
+def _query_q5(req: Q5Request) -> Dict[str, Any]:
+    urls = _q5_dataset_urls(req)
+    for u in urls:
+        _validate_url(u)
+        _parquet_magic_check(u)
+
+    if _is_broad_geo(req.geo) and not S.allow_broad_geo:
+        raise HTTPException(
+            status_code=400,
+            detail="Broad geo selection (admin0=all with no admin1/admin2) is disabled. Select a specific admin0/admin1/admin2 or set ALLOW_BROAD_GEO=true.",
+        )
+
+    if not req.scenario_time:
+        raise HTTPException(status_code=400, detail="scenario_time must include at least one scenario/timeframe pair.")
+
+    read_expr = _read_parquet_expr(urls)
+    geo_where_expr = _geo_where(req.geo)
+
+    con = _duckdb_connect(for_http_parquet=True)
+    try:
+        # Introspect columns so the endpoint can gracefully handle datasets that do not carry value_sd.
+        cols = {
+            str(r[0]).lower()
+            for r in con.execute(f"DESCRIBE SELECT * FROM {read_expr} LIMIT 0").fetchall()
+            if r and len(r) > 0
+        }
+        has_value_sd = "value_sd" in cols
+        has_severity = "severity" in cols
+
+        if (req.severities or []) and not has_severity:
+            raise HTTPException(status_code=400, detail="This dataset does not include a 'severity' column.")
+
+        value_sd_agg = (
+            "SQRT(SUM(CASE WHEN CAST(value_sd AS DOUBLE)=CAST(value_sd AS DOUBLE) THEN POW(CAST(value_sd AS DOUBLE), 2) ELSE 0 END)) AS value_sd"
+            if has_value_sd
+            else "CAST(NULL AS DOUBLE) AS value_sd"
+        )
+
+        severity_clause = _severity_where(req.severities) if has_severity else "TRUE"
+
+        q = f"""
+          SELECT
+            CAST(scenario AS VARCHAR) AS scenario,
+            CAST(timeframe AS VARCHAR) AS timeframe,
+            CAST(hazard AS VARCHAR) AS hazard,
+            COALESCE(SUM(CASE WHEN CAST(value AS DOUBLE)=CAST(value AS DOUBLE) THEN CAST(value AS DOUBLE) ELSE NULL END), 0.0) AS value,
+            {value_sd_agg}
+          FROM {read_expr}
+          WHERE ({_scenario_pairs_where(req.scenario_time)})
+            AND {geo_where_expr}
+            AND {_crop_where(req.commodities)}
+            AND {_hazard_vars_where(req.hazard_vars, req.method, req.commodity_group)}
+            AND {severity_clause}
+            AND hazard IS NOT NULL
+          GROUP BY scenario, timeframe, hazard
+        """
+        base_rows = _rows(con, q)
+    finally:
+        con.close()
+
+    # Normalize to JSON-safe numerics.
+    norm_rows: List[Dict[str, Any]] = []
+    for r in base_rows:
+        vv = _safe_float(r.get("value")) or 0.0
+        sd = _safe_float(r.get("value_sd"))
+        norm_rows.append(
+            {
+                "scenario": str(r.get("scenario") or ""),
+                "timeframe": str(r.get("timeframe") or ""),
+                "hazard": str(r.get("hazard") or ""),
+                "value": vv,
+                "value_sd": sd,
+            }
+        )
+
+    # Build Q5-focused output rows:
+    # - Keep 'any' rows from source (they are not derivable from hazard sums without double-counting)
+    # - Add dry/heat/wet rollups from detailed hazards
+    # - Optionally include detailed hazards too
+    out_map: Dict[tuple, Dict[str, Any]] = {}
+
+    def _accumulate(scenario: str, timeframe: str, hazard: str, value: float, value_sd: Optional[float]) -> None:
+        k = (scenario, timeframe, hazard)
+        if k not in out_map:
+            out_map[k] = {
+                "scenario": scenario,
+                "timeframe": timeframe,
+                "hazard": hazard,
+                "value": 0.0,
+                "_var_sum": 0.0,  # internal accumulator for SD combination
+                "_sd_present": False,
+            }
+        rec = out_map[k]
+        rec["value"] += float(value or 0.0)
+        if value_sd is not None:
+            rec["_sd_present"] = True
+            rec["_var_sum"] += float(value_sd) * float(value_sd)
+
+    for r in norm_rows:
+        h = r["hazard"]
+        if h.lower() == "any":
+            _accumulate(r["scenario"], r["timeframe"], "any", r["value"], r["value_sd"])
+
+    if req.include_rollups:
+        for r in norm_rows:
+            roll = _q5_hazard_rollup_name(r["hazard"])
+            if not roll:
+                continue
+            _accumulate(r["scenario"], r["timeframe"], roll, r["value"], r["value_sd"])
+
+    if req.include_detail_hazards:
+        for r in norm_rows:
+            if str(r.get("hazard") or "").lower() == "any":
+                continue
+            _accumulate(r["scenario"], r["timeframe"], r["hazard"], r["value"], r["value_sd"])
+
+    # Finalize rows + derived fields (year, CI)
+    hazard_filter = set([h.strip().lower() for h in _norm_list(req.hazards or [])]) if req.hazards else None
+    scenario_pairs_lookup = {(str(p.scenario), str(p.timeframe)) for p in req.scenario_time}
+    n_gcm = max(1, int(req.n_gcm_for_ci or 1))
+
+    series: List[Dict[str, Any]] = []
+    for rec in out_map.values():
+        rec_sd: Optional[float] = None
+        if rec.get("_sd_present"):
+            rec_sd = (float(rec.get("_var_sum") or 0.0) ** 0.5)
+
+        scen = str(rec["scenario"])
+        tf = str(rec["timeframe"])
+        hz = str(rec["hazard"])
+        if (scen, tf) not in scenario_pairs_lookup:
+            continue
+        if not req.include_historic and scen.lower().startswith("hist"):
+            continue
+        if hazard_filter is not None and hz.lower() not in hazard_filter:
+            continue
+
+        year = _timeframe_mid_year(tf, req.historic_year)
+        val = float(rec.get("value") or 0.0)
+
+        # 95% CI from SD; if SD is missing, bounds remain null.
+        if rec_sd is not None:
+            se = rec_sd / (n_gcm ** 0.5) if n_gcm > 1 else rec_sd
+            value_low = val - (1.96 * se)
+            value_high = val + (1.96 * se)
+        else:
+            value_low = None
+            value_high = None
+
+        series.append(
+            {
+                "scenario": scen,
+                "timeframe": tf,
+                "year": year,
+                "hazard": hz,
+                "value": val,
+                "value_sd": rec_sd,
+                "value_low": value_low,
+                "value_high": value_high,
+            }
+        )
+
+    # Keep user-requested scenario/time ordering, then Q5 facet order, then year
+    pair_order = {(str(p.scenario), str(p.timeframe)): i for i, p in enumerate(req.scenario_time)}
+    series.sort(
+        key=lambda r: (
+            _q5_hazard_order(str(r.get("hazard") or "")),
+            pair_order.get((str(r.get("scenario") or ""), str(r.get("timeframe") or "")), 10**9),
+            (10**9 if r.get("year") is None else int(r["year"])),
+            str(r.get("scenario") or ""),
+            str(r.get("timeframe") or ""),
+        )
+    )
+
+    hazards_available = []
+    seen_h = set()
+    for r in series:
+        h = str(r.get("hazard") or "")
+        if h not in seen_h:
+            seen_h.add(h)
+            hazards_available.append(h)
+
+    return {
+        "series": series,
+        "meta": {
+            "dataset_count": len(urls),
+            "dataset_urls_used": urls,
+            "request_pairs": [p.model_dump() for p in req.scenario_time],
+            "hazards_available": hazards_available,
+            "has_value_sd": any(row.get("value_sd") is not None for row in series),
+            "n_gcm_for_ci": n_gcm,
+        },
+    }
 
 
 def _validate_url(url: str) -> None:
@@ -1056,7 +1390,71 @@ def _query_denom_by_crop(req: DenomTotalRequest) -> List[Dict[str, Any]]:
 
     return out
 
+def _query_records_page(req: RecordsRequest) -> Dict[str, Any]:
+    _validate_url(req.dataset_url)
+    _parquet_magic_check(req.dataset_url)
 
+    if _is_broad_geo(req.geo) and not S.allow_broad_geo:
+        raise HTTPException(
+            status_code=400,
+            detail="Broad geo selection is disabled. Select a specific admin0/admin1/admin2 or set ALLOW_BROAD_GEO=true.",
+        )
+
+    page = max(1, int(req.page or 1))
+    page_size = max(1, min(int(req.page_size or 100), int(S.export_max_rows)))
+    offset = (page - 1) * page_size
+    order = "value DESC" if req.sort == "value_desc" else "value ASC"
+
+    geo_where_expr = _geo_where(req.geo)
+
+    # Base WHERE
+    where_sql = f"""
+        {_scen_where(req.scen)}
+        AND {geo_where_expr}
+        AND {_crop_where(req.commodities)}
+        AND {_hazard_vars_where(req.hazard_vars, req.method, req.commodity_group)}
+    """
+
+    # Count for pagination UI
+    q_count = f"""
+      SELECT COUNT(*) AS n
+      FROM read_parquet({_sql_q(req.dataset_url)})
+      WHERE {where_sql}
+    """
+
+    # Page rows
+    q_rows = f"""
+      SELECT
+        admin0_name, admin1_name, admin2_name,
+        scenario, timeframe, hazard, hazard_vars, crop,
+        CASE
+          WHEN CAST(value AS DOUBLE)=CAST(value AS DOUBLE) THEN CAST(value AS DOUBLE)
+          ELSE NULL
+        END AS value
+      FROM read_parquet({_sql_q(req.dataset_url)})
+      WHERE {where_sql}
+      ORDER BY {order}
+      LIMIT {page_size} OFFSET {offset}
+    """
+
+    con = _duckdb_connect(for_http_parquet=True)
+    try:
+        n = con.execute(q_count).fetchone()[0]
+        rows = _rows(con, q_rows)
+    finally:
+        con.close()
+
+    # Normalize JSON-safe floats
+    for r in rows:
+        r["value"] = _safe_float(r.get("value"))
+
+    return {
+        "page": page,
+        "page_size": page_size,
+        "total": int(n or 0),
+        "rows": rows,
+        "has_next": (offset + page_size) < int(n or 0),
+    }
 
 def _export_records_csv(req: RecordsRequest) -> str:
     # Guardrail for CSV exports
@@ -1162,6 +1560,8 @@ HZ_CACHE_PREFIXES: List[str] = [
     "hazard_by_crop",
     "by_admin",
     "q1",
+    "q2", 
+    "q5",
     "records",
     "denom_total",
 ]
@@ -1444,6 +1844,34 @@ async def q2(req: Q2Request) -> Dict[str, Any]:
         "relative_label": "% of total exposure" if denom_meta.get("ok") else "% of hazard sum (fallback)",
         "t_ms": dt_ms,
     }
+
+    await cache_store.set_json(key, out, ttl_seconds=ttl)
+    return {"ok": True, "cached": False, **out}
+
+
+
+@app.post("/api/v1/hz/q5")
+async def q5(req: Q5Request) -> Dict[str, Any]:
+    """Q5 scenario/time × hazard uncertainty series.
+
+    Patch 2:
+    - returns chart-ready `series`
+    - adds dry/heat/wet rollups + `any`
+    - adds `year`, `value_low`, `value_high`
+    """
+    assert cache_store is not None
+
+    payload = req.model_dump()
+    key = _cache_key("q5", payload)
+    ttl = _ttl(req.cache_ttl_seconds)
+
+    cached, source = await cache_store.get_json(key, ttl_seconds=ttl)
+    if cached is not None:
+        return {"ok": True, "cached": True, "cache_source": source, **cached}
+
+    t0 = time.time()
+    out = _query_q5(req)
+    out["t_ms"] = int((time.time() - t0) * 1000)
 
     await cache_store.set_json(key, out, ttl_seconds=ttl)
     return {"ok": True, "cached": False, **out}
