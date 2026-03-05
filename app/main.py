@@ -1227,6 +1227,11 @@ def _denom_query_try(
       B) harmonized: columns include (admin*_name, crop, value, exposure, unit[, tech, stat])
 
     We try combinations of possible column names to stay robust.
+
+    Key robustness:
+      - Treat common unit aliases (e.g., usd <-> usd15) as fallbacks.
+      - Exclude NaNs correctly using NOT isnan(...).
+      - If a query binds successfully but matches 0 rows, keep trying other schema/alias combos.
     """
     # column name variants
     exposure_cols = ["exposure", "exposure_short", "exposure_type"]
@@ -1237,74 +1242,117 @@ def _denom_query_try(
     unt = unit
     if exp is None and unt is None and exposure_unit_legacy:
         # If the value looks like a known exposure key, map to Shiny-like defaults.
-        v = str(exposure_unit_legacy).strip()
+        v = str(exposure_unit_legacy).strip().lower()
         if v in ("prod", "area", "vop"):
             exp = {"prod": "prod", "area": "harv-area", "vop": "vop"}[v]
             unt = {"prod": "t", "area": "ha", "vop": "intld15"}[v]
         elif v in ("intld15", "usd", "usd15"):
             exp = "vop"
-            unt = "usd" if v in ("usd", "usd15") else "intld15"
+            unt = v  # keep as provided; aliases handled below
         elif v in ("people", "number"):
             exp, unt = "number", "number"
         else:
             # assume it's a unit (e.g., ha/t/usd/intld15)
             unt = v
 
+    exp = (str(exp).strip().lower() if exp is not None else None)
+    unt = (str(unt).strip().lower() if unt is not None else None)
+
+    def _unit_aliases(u: Optional[str]) -> List[Optional[str]]:
+        if not u:
+            return [None]
+        uu = str(u).strip().lower()
+        out: List[str] = [uu]
+        # Common aliases seen across Atlas denom tables
+        if uu == "usd":
+            out.append("usd15")
+        elif uu == "usd15":
+            out.append("usd")
+        # De-duplicate while preserving order
+        dedup: List[str] = []
+        seen = set()
+        for x in out:
+            if x in seen:
+                continue
+            seen.add(x)
+            dedup.append(x)
+        return dedup
+
     last_err: Optional[Exception] = None
 
     # Try: with exposure+unit; then unit only; then legacy exposure_unit only
-    attempts = []
+    attempts: List[Tuple[str, Optional[str], Optional[str]]] = []
     if exp and unt:
         attempts.append(("exp+unit", exp, unt))
     if unt:
         attempts.append(("unit", None, unt))
     if exposure_unit_legacy:
-        attempts.append(("legacy", None, exposure_unit_legacy))
+        attempts.append(("legacy", None, str(exposure_unit_legacy).strip().lower()))
+
+    # NaN-safe value expression (DuckDB: isnan(double))
+    val_expr = "CASE WHEN NOT isnan(CAST(value AS DOUBLE)) THEN CAST(value AS DOUBLE) ELSE NULL END"
 
     for _, exp_val, unit_val in attempts:
-        for use_exp_col in ([True] if exp_val else [False]):
-            for exp_col in (exposure_cols if use_exp_col else [None]):
-                for unit_col in unit_cols:
-                    for use_tech in (True, False):
-                        wheres = list(base_wheres)
+        unit_candidates = _unit_aliases(unit_val) if unit_val else [None]
 
-                        if exp_val and exp_col:
-                            wheres.append(f"{exp_col} = {_sql_q(exp_val)}")
-                        if unit_val:
-                            wheres.append(f"{unit_col} = {_sql_q(unit_val)}")
-                        if use_tech:
-                            # Shiny uses: (tech='all' OR tech IS NULL)
-                            wheres.append("(tech = 'all' OR tech IS NULL)")
+        for unit_candidate in unit_candidates:
+            for use_exp_col in ([True] if exp_val else [False]):
+                for exp_col in (exposure_cols if use_exp_col else [None]):
+                    for unit_col in unit_cols:
+                        for use_tech in (True, False):
+                            wheres = list(base_wheres)
 
-                        where_sql = " AND ".join(wheres) if wheres else "TRUE"
+                            if exp_val and exp_col:
+                                wheres.append(f"{exp_col} = {_sql_q(exp_val)}")
+                            if unit_candidate:
+                                wheres.append(f"{unit_col} = {_sql_q(unit_candidate)}")
+                            if use_tech:
+                                # Shiny uses: (tech='all' OR tech IS NULL)
+                                wheres.append("(tech = 'all' OR tech IS NULL)")
 
-                        if group_by_crop:
-                            q = f"""
-                              SELECT crop,
-                                     COALESCE(SUM(CASE WHEN CAST(value AS DOUBLE)=CAST(value AS DOUBLE)
-                                                       THEN CAST(value AS DOUBLE) ELSE NULL END), 0.0) AS denom
-                              FROM read_parquet({_sql_q(denom_url)})
-                              WHERE {where_sql}
-                              GROUP BY crop
-                            """
-                        else:
-                            q = f"""
-                              SELECT COALESCE(SUM(CASE WHEN CAST(value AS DOUBLE)=CAST(value AS DOUBLE)
-                                                       THEN CAST(value AS DOUBLE) ELSE NULL END), 0.0) AS denom
-                              FROM read_parquet({_sql_q(denom_url)})
-                              WHERE {where_sql}
-                            """
+                            where_sql = " AND ".join(wheres) if wheres else "TRUE"
 
-                        try:
-                            return _rows(con, q)
-                        except Exception as e:
-                            msg = str(e)
-                            last_err = e
-                            # schema mismatch: try next combo
-                            if "Binder" in msg and ("Referenced column" in msg or "Column" in msg):
+                            if group_by_crop:
+                                q = f"""
+                                  SELECT crop,
+                                         COUNT(*) AS n_rows,
+                                         COALESCE(SUM({val_expr}), 0.0) AS denom
+                                  FROM read_parquet({_sql_q(denom_url)})
+                                  WHERE {where_sql}
+                                  GROUP BY crop
+                                """
+                            else:
+                                q = f"""
+                                  SELECT COUNT(*) AS n_rows,
+                                         COALESCE(SUM({val_expr}), 0.0) AS denom
+                                  FROM read_parquet({_sql_q(denom_url)})
+                                  WHERE {where_sql}
+                                """
+
+                            try:
+                                rows = _rows(con, q)
+
+                                # If the query bound successfully but matched 0 rows, try the next schema/alias combo.
+                                matched = False
+                                if group_by_crop:
+                                    matched = any(int(r.get("n_rows") or 0) > 0 for r in rows)
+                                else:
+                                    matched = bool(rows) and int(rows[0].get("n_rows") or 0) > 0
+
+                                if matched:
+                                    return rows
+
+                                # Not matched: continue trying other combinations (do not treat as success).
                                 continue
-                            # other errors should surface
-                            raise
+
+                            except Exception as e:
+                                msg = str(e)
+                                last_err = e
+                                # schema mismatch: try next combo
+                                if "Binder" in msg and ("Referenced column" in msg or "Column" in msg):
+                                    continue
+                                # other errors should surface
+                                raise
 
     if last_err:
         raise last_err
@@ -1338,14 +1386,23 @@ def _query_denom_total(req: DenomTotalRequest) -> Dict[str, Any]:
             req.exposure_unit,
             group_by_crop=False,
         )
+
         denom = rows[0].get("denom") if rows else None
+        n_rows = int(rows[0].get("n_rows") or 0) if rows and ("n_rows" in rows[0]) else 0
+
         try:
             n = float(denom) if denom is not None else None
         except Exception:
             n = None
 
-        ok = n is not None and n == n
-        return {"ok": ok, "denom": n, "error": None if ok else "Denominator is missing/NaN"}
+        # Consider denom usable only if:
+        # - query matched at least one row
+        # - denom is numeric and not NaN/Inf
+        # - denom is positive (prevents misleading "ok" for schema mismatches that return 0)
+        ok = (n is not None) and (n == n) and (n not in (float("inf"), float("-inf"))) and (n_rows > 0) and (n > 0)
+
+        err = None if ok else ("No matching denominator rows" if n_rows == 0 else "Denominator is missing/NaN/zero")
+        return {"ok": ok, "denom": n if (n is not None and n == n) else None, "error": err}
     finally:
         con.close()
 
