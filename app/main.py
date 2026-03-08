@@ -436,7 +436,9 @@ def _read_parquet_expr(urls: List[str]) -> str:
         raise HTTPException(status_code=400, detail="No dataset URLs provided.")
     if len(vals) == 1:
         return f"read_parquet({_sql_q(vals[0])})"
-    return "read_parquet([" + ", ".join(_sql_q(u) for u in vals) + "])"
+    # Important for Q5 mixed-schema reads (e.g. historic without value_sd + ensemble with value_sd).
+    # This preserves all columns across files and fills missing ones with NULL instead of dropping them.
+    return "read_parquet([" + ", ".join(_sql_q(u) for u in vals) + "], union_by_name=true)"
 
 
 def _q5_dataset_urls(req: Q5Request) -> List[str]:
@@ -1910,11 +1912,6 @@ async def q2(req: Q2Request) -> Dict[str, Any]:
 @app.post("/api/v1/hz/q5")
 async def q5(req: Q5Request) -> Dict[str, Any]:
     """Q5 scenario/time × hazard uncertainty series.
-
-    Patch 2:
-    - returns chart-ready `series`
-    - adds dry/heat/wet rollups + `any`
-    - adds `year`, `value_low`, `value_high`
     """
     assert cache_store is not None
 
