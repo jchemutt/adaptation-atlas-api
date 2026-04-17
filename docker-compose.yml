@@ -13,4 +13,5 @@ services:
       - "127.0.0.1:${API_PORT:-18080}:8000"
     volumes:
       - ./data:/data
+      - ./app/prefetch_parquets.py:/app/prefetch_parquets.py:ro
     restart: unless-stopped

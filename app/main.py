@@ -4,9 +4,10 @@ import time
 import hashlib
 import tempfile
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from typing import Any, Dict, Iterator, List, Optional, Tuple
+from urllib.parse import quote, urlparse
 
 import duckdb
 import httpx
@@ -42,6 +43,11 @@ class Settings:
     allow_broad_geo: bool
 
     parquet_magic_check: bool
+    parquet_cache_dir: str
+    parquet_cache_enabled: bool
+    parquet_cache_refresh: bool
+    parquet_download_timeout_seconds: int
+    parquet_download_lock_timeout_seconds: int
     export_max_rows: int
 
     @classmethod
@@ -83,6 +89,11 @@ class Settings:
         allow_broad_geo = _bool("ALLOW_BROAD_GEO", "false")
 
         parquet_magic_check = _bool("PARQUET_MAGIC_CHECK", "true")
+        parquet_cache_dir = os.getenv("PARQUET_CACHE_DIR", "/data/parquet_cache").strip() or "/data/parquet_cache"
+        parquet_cache_enabled = _bool("PARQUET_CACHE_ENABLED", "true")
+        parquet_cache_refresh = _bool("PARQUET_CACHE_REFRESH", "false")
+        parquet_download_timeout_seconds = int(os.getenv("PARQUET_DOWNLOAD_TIMEOUT_SECONDS", "600"))
+        parquet_download_lock_timeout_seconds = int(os.getenv("PARQUET_DOWNLOAD_LOCK_TIMEOUT_SECONDS", "300"))
         export_max_rows = int(os.getenv("EXPORT_MAX_ROWS", "200000"))
 
         return cls(
@@ -102,6 +113,11 @@ class Settings:
             cors_origin_regex=cors_origin_regex,
             allow_broad_geo=allow_broad_geo,
             parquet_magic_check=parquet_magic_check,
+            parquet_cache_dir=parquet_cache_dir,
+            parquet_cache_enabled=parquet_cache_enabled,
+            parquet_cache_refresh=parquet_cache_refresh,
+            parquet_download_timeout_seconds=parquet_download_timeout_seconds,
+            parquet_download_lock_timeout_seconds=parquet_download_lock_timeout_seconds,
             export_max_rows=export_max_rows,
         )
 
@@ -109,6 +125,16 @@ class Settings:
 S = Settings.from_env()
 
 print('CORS config:', {'cors_origins': S.cors_origins, 'cors_origin_regex': S.cors_origin_regex})
+print(
+    "Parquet cache config:",
+    {
+        "enabled": S.parquet_cache_enabled,
+        "cache_dir": S.parquet_cache_dir,
+        "refresh": S.parquet_cache_refresh,
+        "download_timeout_seconds": S.parquet_download_timeout_seconds,
+        "download_lock_timeout_seconds": S.parquet_download_lock_timeout_seconds,
+    },
+)
 
 
 
@@ -402,7 +428,7 @@ def _hazard_vars_where(hazard_vars: Optional[List[str]], method: str, commodity_
             return "TRUE"
         return f"hazard_vars IN ({', '.join(_sql_q(v) for v in vals)})"
 
-    # Defaults (matching what you used in the notebook)
+    # Defaults
     generic = ["NDWS+NTx35+NDWL0", "NDWS+THI-max+NDWL0"]
     crop_specific = ["PTOT-L+NTxS+PTOT-G", "PTOT-L+THI-max+PTOT-G"]
 
@@ -430,15 +456,154 @@ def _scenario_pairs_where(pairs: List[Q5ScenarioTime]) -> str:
     return " OR ".join(wh) if wh else "FALSE"
 
 
-def _read_parquet_expr(urls: List[str]) -> str:
+def _source_needs_httpfs(path_or_url: str) -> bool:
+    scheme = (urlparse(str(path_or_url)).scheme or "").lower()
+    return scheme == "https"
+
+
+def _public_https_url_for_source(url: str) -> str:
+    parsed = urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+
+    if scheme == "https":
+        return url
+
+    if scheme == "s3":
+        bucket = (parsed.netloc or "").strip()
+        key = parsed.path.lstrip("/")
+        if not bucket or not key:
+            raise HTTPException(status_code=400, detail=f"Invalid s3:// parquet URL: {url}")
+        quoted_key = quote(key, safe="/-_.~")
+        return f"https://{bucket}.s3.amazonaws.com/{quoted_key}"
+
+    raise HTTPException(status_code=400, detail=f"Unsupported parquet source scheme: {url}")
+
+
+def _safe_local_parquet_path(url: str) -> str:
+    canonical_url = _public_https_url_for_source(url)
+    parsed = urlparse(canonical_url)
+    leaf = os.path.basename(parsed.path) or "data.parquet"
+    safe_leaf = re.sub(r"[^A-Za-z0-9._-]+", "_", leaf)
+    digest = hashlib.sha1(canonical_url.encode("utf-8")).hexdigest()
+    return os.path.join(S.parquet_cache_dir, f"{digest}_{safe_leaf}")
+
+
+def _verify_local_parquet_file(path: str) -> None:
+    try:
+        size = os.path.getsize(path)
+        if size < 8:
+            raise HTTPException(status_code=500, detail=f"Downloaded parquet is too small: {path}")
+        with open(path, "rb") as f:
+            head = f.read(4)
+            f.seek(-4, os.SEEK_END)
+            tail = f.read(4)
+        if head != b"PAR1" or tail != b"PAR1":
+            raise HTTPException(status_code=500, detail=f"Downloaded file is not a valid parquet file: {path}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to verify parquet file {path}: {e}") from e
+
+
+@contextmanager
+def _download_lock(lock_path: str, timeout_seconds: Optional[int] = None, poll_seconds: float = 0.25) -> Iterator[None]:
+    timeout = max(1, int(timeout_seconds or S.parquet_download_lock_timeout_seconds))
+    started = time.time()
+    while True:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, str(os.getpid()).encode("utf-8"))
+            finally:
+                os.close(fd)
+            break
+        except FileExistsError:
+            if (time.time() - started) >= timeout:
+                raise HTTPException(status_code=504, detail=f"Timeout waiting for parquet download lock: {lock_path}")
+            time.sleep(poll_seconds)
+
+    try:
+        yield
+    finally:
+        try:
+            os.remove(lock_path)
+        except FileNotFoundError:
+            pass
+
+
+def _download_remote_parquet_to_local(url: str, local_path: str) -> None:
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    tmp_dir = os.path.dirname(local_path) or None
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".parquet", dir=tmp_dir)
+    tmp_path = tmp.name
+    tmp.close()
+
+    public_url = _public_https_url_for_source(url)
+
+    try:
+        with httpx.stream("GET", public_url, timeout=S.parquet_download_timeout_seconds, follow_redirects=True) as response:
+            response.raise_for_status()
+            with open(tmp_path, "wb") as f:
+                for chunk in response.iter_bytes():
+                    if chunk:
+                        f.write(chunk)
+
+        _verify_local_parquet_file(tmp_path)
+        os.replace(tmp_path, local_path)
+    except HTTPException:
+        try:
+            os.remove(tmp_path)
+        except FileNotFoundError:
+            pass
+        raise
+    except Exception as e:
+        try:
+            os.remove(tmp_path)
+        except FileNotFoundError:
+            pass
+        raise HTTPException(status_code=500, detail=f"Failed to cache parquet locally from {public_url}: {e}") from e
+
+
+def _resolve_parquet_source(url: str) -> str:
+    _validate_url(url)
+    public_url = _public_https_url_for_source(url)
+
+    if not S.parquet_cache_enabled:
+        _parquet_magic_check(public_url)
+        return public_url
+
+    local_path = _safe_local_parquet_path(url)
+    if os.path.exists(local_path) and not S.parquet_cache_refresh:
+        return local_path
+
+    lock_path = local_path + ".lock"
+    with _download_lock(lock_path):
+        if os.path.exists(local_path) and not S.parquet_cache_refresh:
+            return local_path
+
+        _parquet_magic_check(public_url)
+        _download_remote_parquet_to_local(public_url, local_path)
+
+    return local_path
+
+
+def _read_parquet_expr(urls: List[str]) -> Tuple[str, List[str], bool]:
     vals = [u for u in (_norm_list(urls) or []) if u]
     if not vals:
         raise HTTPException(status_code=400, detail="No dataset URLs provided.")
-    if len(vals) == 1:
-        return f"read_parquet({_sql_q(vals[0])})"
+
+    resolved = [_resolve_parquet_source(u) for u in vals]
+    needs_httpfs = any(_source_needs_httpfs(u) for u in resolved)
+
+    if len(resolved) == 1:
+        return f"read_parquet({_sql_q(resolved[0])})", resolved, needs_httpfs
     # Important for Q5 mixed-schema reads (e.g. historic without value_sd + ensemble with value_sd).
     # This preserves all columns across files and fills missing ones with NULL instead of dropping them.
-    return "read_parquet([" + ", ".join(_sql_q(u) for u in vals) + "], union_by_name=true)"
+    return (
+        "read_parquet([" + ", ".join(_sql_q(u) for u in resolved) + "], union_by_name=true)",
+        resolved,
+        needs_httpfs,
+    )
 
 
 def _q5_dataset_urls(req: Q5Request) -> List[str]:
@@ -486,7 +651,7 @@ def _q5_hazard_rollup_name(hazard: Optional[str]) -> Optional[str]:
         return None
     if h.endswith("(any)"):
         return None
-    # Shiny-style Q5 facets: dry (any), heat (any), wet (any)
+    # dry (any), heat (any), wet (any)
     if h.startswith("dry"):
         return "dry (any)"
     if h.startswith("heat"):
@@ -522,9 +687,6 @@ def _safe_float(v: Any) -> Optional[float]:
 
 def _query_q5(req: Q5Request) -> Dict[str, Any]:
     urls = _q5_dataset_urls(req)
-    for u in urls:
-        _validate_url(u)
-        _parquet_magic_check(u)
 
     if _is_broad_geo(req.geo) and not S.allow_broad_geo:
         raise HTTPException(
@@ -535,10 +697,10 @@ def _query_q5(req: Q5Request) -> Dict[str, Any]:
     if not req.scenario_time:
         raise HTTPException(status_code=400, detail="scenario_time must include at least one scenario/timeframe pair.")
 
-    read_expr = _read_parquet_expr(urls)
+    read_expr, resolved_urls, needs_httpfs = _read_parquet_expr(urls)
     geo_where_expr = _geo_where(req.geo)
 
-    con = _duckdb_connect(for_http_parquet=True)
+    con = _duckdb_connect(for_http_parquet=needs_httpfs)
     try:
         # Introspect columns so the endpoint can gracefully handle datasets that do not carry value_sd.
         cols = {
@@ -707,6 +869,7 @@ def _query_q5(req: Q5Request) -> Dict[str, Any]:
         "meta": {
             "dataset_count": len(urls),
             "dataset_urls_used": urls,
+            "resolved_dataset_paths": resolved_urls,
             "request_pairs": [p.model_dump() for p in req.scenario_time],
             "hazards_available": hazards_available,
             "has_value_sd": any(row.get("value_sd") is not None for row in series),
@@ -716,7 +879,7 @@ def _query_q5(req: Q5Request) -> Dict[str, Any]:
 
 
 def _validate_url(url: str) -> None:
-    # Allow opt-out of URL restrictions for trusted deployments.
+
     if S.allow_any_url:
         return
 
@@ -951,8 +1114,7 @@ def _rows(con: duckdb.DuckDBPyConnection, query: str) -> List[Dict[str, Any]]:
 
 
 def _query_totals_by_hazard(req: TotalsByHazardRequest) -> List[Dict[str, Any]]:
-    _validate_url(req.dataset_url)
-    _parquet_magic_check(req.dataset_url)
+    dataset_source = _resolve_parquet_source(req.dataset_url)
 
     if _is_broad_geo(req.geo) and not S.allow_broad_geo:
         raise HTTPException(
@@ -964,7 +1126,7 @@ def _query_totals_by_hazard(req: TotalsByHazardRequest) -> List[Dict[str, Any]]:
 
     q = f"""
       SELECT hazard, COALESCE(SUM(CASE WHEN CAST(value AS DOUBLE)=CAST(value AS DOUBLE) THEN CAST(value AS DOUBLE) ELSE NULL END), 0.0) AS total
-      FROM read_parquet({_sql_q(req.dataset_url)})
+      FROM read_parquet({_sql_q(dataset_source)})
       WHERE {_scen_where(req.scen)}
         AND {geo_where_expr}
         AND {_crop_where(req.commodities)}
@@ -974,7 +1136,7 @@ def _query_totals_by_hazard(req: TotalsByHazardRequest) -> List[Dict[str, Any]]:
       ORDER BY total DESC
     """
 
-    con = _duckdb_connect(for_http_parquet=True)
+    con = _duckdb_connect(for_http_parquet=_source_needs_httpfs(dataset_source))
     try:
         return _rows(con, q)
     finally:
@@ -982,8 +1144,7 @@ def _query_totals_by_hazard(req: TotalsByHazardRequest) -> List[Dict[str, Any]]:
 
 
 def _query_totals_by_crop(req: TotalsByCropRequest) -> List[Dict[str, Any]]:
-    _validate_url(req.dataset_url)
-    _parquet_magic_check(req.dataset_url)
+    dataset_source = _resolve_parquet_source(req.dataset_url)
 
     if _is_broad_geo(req.geo) and not S.allow_broad_geo:
         raise HTTPException(
@@ -995,7 +1156,7 @@ def _query_totals_by_crop(req: TotalsByCropRequest) -> List[Dict[str, Any]]:
 
     q = f"""
       SELECT crop, COALESCE(SUM(CASE WHEN CAST(value AS DOUBLE)=CAST(value AS DOUBLE) THEN CAST(value AS DOUBLE) ELSE NULL END), 0.0) AS total
-      FROM read_parquet({_sql_q(req.dataset_url)})
+      FROM read_parquet({_sql_q(dataset_source)})
       WHERE {_scen_where(req.scen)}
         AND {geo_where_expr}
         AND {_crop_where(req.commodities)}
@@ -1005,7 +1166,7 @@ def _query_totals_by_crop(req: TotalsByCropRequest) -> List[Dict[str, Any]]:
       ORDER BY total DESC
     """
 
-    con = _duckdb_connect(for_http_parquet=True)
+    con = _duckdb_connect(for_http_parquet=_source_needs_httpfs(dataset_source))
     try:
         return _rows(con, q)
     finally:
@@ -1052,8 +1213,7 @@ def _query_hazard_by_crop(req: HazardByCropRequest) -> List[Dict[str, Any]]:
       (result cardinality is small: hazards × crops)
     - optionally bucket non-top crops into "Other" (keeps totals consistent for stacked charts)
     """
-    _validate_url(req.dataset_url)
-    _parquet_magic_check(req.dataset_url)
+    dataset_source = _resolve_parquet_source(req.dataset_url)
 
     if _is_broad_geo(req.geo) and not S.allow_broad_geo:
         raise HTTPException(
@@ -1065,7 +1225,7 @@ def _query_hazard_by_crop(req: HazardByCropRequest) -> List[Dict[str, Any]]:
 
     q = f"""
       SELECT hazard, crop, COALESCE(SUM(CASE WHEN CAST(value AS DOUBLE)=CAST(value AS DOUBLE) THEN CAST(value AS DOUBLE) ELSE NULL END), 0.0) AS total
-      FROM read_parquet({_sql_q(req.dataset_url)})
+      FROM read_parquet({_sql_q(dataset_source)})
       WHERE {_scen_where(req.scen)}
         AND {geo_where_expr}
         AND {_crop_where(req.commodities)}
@@ -1076,7 +1236,7 @@ def _query_hazard_by_crop(req: HazardByCropRequest) -> List[Dict[str, Any]]:
       GROUP BY hazard, crop
     """
 
-    con = _duckdb_connect(for_http_parquet=True)
+    con = _duckdb_connect(for_http_parquet=_source_needs_httpfs(dataset_source))
     try:
         rows = _rows(con, q)
     finally:
@@ -1143,8 +1303,7 @@ def _query_hazard_by_crop(req: HazardByCropRequest) -> List[Dict[str, Any]]:
     return rows
 
 def _query_by_admin(req: ByAdminRequest) -> List[Dict[str, Any]]:
-    _validate_url(req.dataset_url)
-    _parquet_magic_check(req.dataset_url)
+    dataset_source = _resolve_parquet_source(req.dataset_url)
 
     if _is_broad_geo(req.geo) and not S.allow_broad_geo:
         raise HTTPException(
@@ -1154,8 +1313,7 @@ def _query_by_admin(req: ByAdminRequest) -> List[Dict[str, Any]]:
     group_field, non_null = (_resolve_admin_group_fields(req.geo) if req.group_child else _resolve_admin_group_fields_current(req.geo))
     geo_where_expr = _geo_where_parent(req.geo) if req.group_child else _geo_where(req.geo)
 
-    # Backward-compatible default: totals by admin only.
-    # Optional Q4 mode: also group by hazard so the client can build compound/non-compound stacks.
+  
     if bool(getattr(req, "group_hazard", False)):
         q = f"""
   SELECT
@@ -1170,7 +1328,7 @@ def _query_by_admin(req: ByAdminRequest) -> List[Dict[str, Any]]:
       ),
       0.0
     ) AS total
-  FROM read_parquet({_sql_q(req.dataset_url)})
+  FROM read_parquet({_sql_q(dataset_source)})
   WHERE {_scen_where(req.scen)}
     AND {geo_where_expr}
     AND {_crop_where(req.commodities)}
@@ -1194,7 +1352,7 @@ def _query_by_admin(req: ByAdminRequest) -> List[Dict[str, Any]]:
       ),
       0.0
     ) AS total
-  FROM read_parquet({_sql_q(req.dataset_url)})
+  FROM read_parquet({_sql_q(dataset_source)})
   WHERE {_scen_where(req.scen)}
     AND {geo_where_expr}
     AND {_crop_where(req.commodities)}
@@ -1205,7 +1363,7 @@ def _query_by_admin(req: ByAdminRequest) -> List[Dict[str, Any]]:
   ORDER BY total DESC
 """
 
-    con = _duckdb_connect(for_http_parquet=True)
+    con = _duckdb_connect(for_http_parquet=_source_needs_httpfs(dataset_source))
     try:
         return _rows(con, q)
     finally:
@@ -1222,19 +1380,7 @@ def _denom_query_try(
     exposure_unit_legacy: Optional[str],
     group_by_crop: bool,
 ) -> Any:
-    """Try denom queries against slightly different schemas.
 
-    Supported denom schemas we see in Atlas/Shiny:
-      A) legacy: columns include (admin0_name, admin1_name, admin2_name, crop, value, exposure_unit[, tech])
-      B) harmonized: columns include (admin*_name, crop, value, exposure, unit[, tech, stat])
-
-    We try combinations of possible column names to stay robust.
-
-    Key robustness:
-      - Treat common unit aliases (e.g., usd <-> usd15) as fallbacks.
-      - Exclude NaNs correctly using NOT isnan(...).
-      - If a query binds successfully but matches 0 rows, keep trying other schema/alias combos.
-    """
     # column name variants
     exposure_cols = ["exposure", "exposure_short", "exposure_type"]
     unit_cols = ["unit", "exposure_unit"]
@@ -1363,8 +1509,7 @@ def _denom_query_try(
 
 
 def _query_denom_total(req: DenomTotalRequest) -> Dict[str, Any]:
-    _validate_url(req.denom_url)
-    _parquet_magic_check(req.denom_url)
+    denom_source = _resolve_parquet_source(req.denom_url)
 
     if _is_broad_geo(req.geo) and not S.allow_broad_geo:
         raise HTTPException(
@@ -1377,11 +1522,11 @@ def _query_denom_total(req: DenomTotalRequest) -> Dict[str, Any]:
         _crop_where(req.commodities),
     ]
 
-    con = _duckdb_connect(for_http_parquet=True)
+    con = _duckdb_connect(for_http_parquet=_source_needs_httpfs(denom_source))
     try:
         rows = _denom_query_try(
             con,
-            req.denom_url,
+            denom_source,
             wheres,
             req.exposure,
             req.unit,
@@ -1416,8 +1561,7 @@ def _query_denom_by_crop(req: DenomTotalRequest) -> List[Dict[str, Any]]:
     This is used by Q2/Q4 to compute derived categories such as "no hazard" as:
       value_tot(crop) - value_any_hazard(crop)
     """
-    _validate_url(req.denom_url)
-    _parquet_magic_check(req.denom_url)
+    denom_source = _resolve_parquet_source(req.denom_url)
 
     if _is_broad_geo(req.geo) and not S.allow_broad_geo:
         raise HTTPException(
@@ -1430,9 +1574,9 @@ def _query_denom_by_crop(req: DenomTotalRequest) -> List[Dict[str, Any]]:
         _crop_where(req.commodities),
     ]
 
-    con = _duckdb_connect(for_http_parquet=True)
+    con = _duckdb_connect(for_http_parquet=_source_needs_httpfs(denom_source))
     try:
-        rows = _denom_query_try(con, req.denom_url, base_wheres, req.exposure, req.unit, req.exposure_unit, group_by_crop=True)
+        rows = _denom_query_try(con, denom_source, base_wheres, req.exposure, req.unit, req.exposure_unit, group_by_crop=True)
     finally:
         con.close()
 
@@ -1450,8 +1594,7 @@ def _query_denom_by_crop(req: DenomTotalRequest) -> List[Dict[str, Any]]:
     return out
 
 def _query_records_page(req: RecordsRequest) -> Dict[str, Any]:
-    _validate_url(req.dataset_url)
-    _parquet_magic_check(req.dataset_url)
+    dataset_source = _resolve_parquet_source(req.dataset_url)
 
     if _is_broad_geo(req.geo) and not S.allow_broad_geo:
         raise HTTPException(
@@ -1477,7 +1620,7 @@ def _query_records_page(req: RecordsRequest) -> Dict[str, Any]:
     # Count for pagination UI
     q_count = f"""
       SELECT COUNT(*) AS n
-      FROM read_parquet({_sql_q(req.dataset_url)})
+      FROM read_parquet({_sql_q(dataset_source)})
       WHERE {where_sql}
     """
 
@@ -1490,13 +1633,13 @@ def _query_records_page(req: RecordsRequest) -> Dict[str, Any]:
           WHEN CAST(value AS DOUBLE)=CAST(value AS DOUBLE) THEN CAST(value AS DOUBLE)
           ELSE NULL
         END AS value
-      FROM read_parquet({_sql_q(req.dataset_url)})
+      FROM read_parquet({_sql_q(dataset_source)})
       WHERE {where_sql}
       ORDER BY {order}
       LIMIT {page_size} OFFSET {offset}
     """
 
-    con = _duckdb_connect(for_http_parquet=True)
+    con = _duckdb_connect(for_http_parquet=_source_needs_httpfs(dataset_source))
     try:
         n = con.execute(q_count).fetchone()[0]
         rows = _rows(con, q_rows)
@@ -1516,6 +1659,8 @@ def _query_records_page(req: RecordsRequest) -> Dict[str, Any]:
     }
 
 def _export_records_csv(req: RecordsRequest) -> str:
+    dataset_source = _resolve_parquet_source(req.dataset_url)
+
     # Guardrail for CSV exports
     limit_rows = min(S.export_max_rows, max(1, int(req.page_size)))
     order = "value DESC" if req.sort == "value_desc" else "value ASC"
@@ -1526,7 +1671,7 @@ def _export_records_csv(req: RecordsRequest) -> str:
       SELECT admin0_name, admin1_name, admin2_name,
              scenario, timeframe, hazard, hazard_vars, crop,
              CASE WHEN CAST(value AS DOUBLE)=CAST(value AS DOUBLE) THEN CAST(value AS DOUBLE) ELSE NULL END AS value
-      FROM read_parquet({_sql_q(req.dataset_url)})
+      FROM read_parquet({_sql_q(dataset_source)})
       WHERE {_scen_where(req.scen)}
         AND {geo_where_expr}
         AND {_crop_where(req.commodities)}
@@ -1535,7 +1680,7 @@ def _export_records_csv(req: RecordsRequest) -> str:
       LIMIT {limit_rows}
     """
 
-    con = _duckdb_connect(for_http_parquet=True)
+    con = _duckdb_connect(for_http_parquet=_source_needs_httpfs(dataset_source))
     try:
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
         tmp_path = tmp.name
@@ -1571,6 +1716,9 @@ async def startup() -> None:
     cache_store = CacheStore(redis)
     cache_store.init_materialized_cache()
 
+    if S.parquet_cache_enabled:
+        os.makedirs(S.parquet_cache_dir, exist_ok=True)
+
     # Warm up DuckDB + httpfs
     con = _duckdb_connect(for_http_parquet=True)
     con.close()
@@ -1600,6 +1748,9 @@ async def health() -> Dict[str, Any]:
         "cache_materialize": S.cache_materialize,
         "allowed_hosts": ["*"] if S.allow_any_url else S.allowed_parquet_hosts,
         "allow_broad_geo": S.allow_broad_geo,
+        "parquet_cache_enabled": S.parquet_cache_enabled,
+        "parquet_cache_dir": S.parquet_cache_dir,
+        "parquet_cache_refresh": S.parquet_cache_refresh,
     }
 
 
@@ -1962,9 +2113,6 @@ async def records_csv(req: RecordsRequest, bg: BackgroundTasks) -> FileResponse:
 
     Guardrail: EXPORT_MAX_ROWS (default 200k). Increase only if you really need it.
     """
-    _validate_url(req.dataset_url)
-    _parquet_magic_check(req.dataset_url)
-
     path = _export_records_csv(req)
     bg.add_task(_cleanup_file, path)
 
